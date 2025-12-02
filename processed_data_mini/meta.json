@@ -1,0 +1,11 @@
+{
+  "total_samples": 2000,
+  "total_shards": 1,
+  "total_tokens": 18354554,
+  "shard_size": 10000,
+  "max_seq_len": 24576,
+  "vocab_size": 643,
+  "shards": [
+    "shard_0000.pt"
+  ]
+}

@@ -37,14 +37,24 @@ env/
 .ipynb_checkpoints/
 *.ipynb
 
-# Data files
+# Data
+data/
+processed_data/
+processed_data*/
+*.mid
+*.midi
+*.npz
+*.pkl
+*.cache
+*.wav
+*.mp3
+
+# Checkpoints
+checkpoints/
+outputs/
 *.pt
 *.pth
 *.ckpt
-*.mid
-*.midi
-*.wav
-*.mp3
 
 # Logs
 *.log
@@ -56,9 +66,20 @@ wandb/
 .DS_Store
 Thumbs.db
 
-# Model checkpoints
-checkpoints/
-outputs/
+# Temporary files
+*.tmp
+tmp/
 
-# Processed data
-processed_data*/
+# Compressed files
+*.tar.gz
+*.zip
+
+# Test outputs
+test_output/
+optimal_config.json
+
+# Archived code
+archived/
+
+# External models
+Qwen3-Embedding-0.6B/
