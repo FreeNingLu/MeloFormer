@@ -16,7 +16,7 @@ torch._dynamo.config.cache_size_limit = 2048
 torch._dynamo.config.accumulated_cache_size_limit = 4096
 
 # 添加项目路径
-sys.path.insert(0, str(Path(__file__).parent / 'hid_museformer_v0.9'))
+sys.path.insert(0, str(Path(__file__).parent / 'hid_museformer_v1.0'))
 
 from model.hid_museformer import HIDMuseFormer
 

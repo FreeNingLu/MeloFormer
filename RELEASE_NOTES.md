@@ -43,7 +43,7 @@ MeloFormer/
 ├── CHANGELOG.md              # 完整更新日志
 ├── RELEASE_NOTES.md          # 本文件
 ├── README.md                 # 使用文档
-├── hid_museformer_v0.9/      # 核心代码
+├── hid_museformer_v1.0/      # 核心代码
 ├── test_memory_profile.py    # 显存测试工具
 ├── test_max_seqlen.py        # 序列长度测试工具
 ├── text2music/               # Diffusion Bridge (开发中)

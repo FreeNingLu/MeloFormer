@@ -63,6 +63,8 @@ python convert_to_arrow.py \
 ### 训练
 
 ```bash
+cd hid_museformer_v1.0
+
 # 使用 Arrow 数据（推荐）
 python train.py \
     --model_size large \
