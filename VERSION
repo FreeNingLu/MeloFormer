@@ -1,0 +1,11 @@
+1.0.1
+
+MeloFormer - HID-MuseFormer
+Release Date: 2024-12-02
+
+三阶段动态优化版本
+- Phase 1 (Step 1-10): batch_size=1, num_workers=0
+- Phase 2 (Step 11-100): batch_size=1, num_workers=8
+- Phase 3 (Step 101+): batch_size=6, num_workers=8
+
+基于 H800 80GB 实测数据优化
