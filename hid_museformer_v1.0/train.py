@@ -210,6 +210,7 @@ class PreprocessedDataset(Dataset):
 def efficient_collate_fn(batch: List[Optional[Dict]]) -> Optional[Dict[str, torch.Tensor]]:
     """
     高效的批次整理函数
+    - 序列长度分桶: 减少 FlexAttention 重编译次数
     - 动态 padding 到 batch 内最大长度 (减少无效计算)
     - 过滤掉 None 样本 (超过 max_bars 的样本)
     """
@@ -222,6 +223,14 @@ def efficient_collate_fn(batch: List[Optional[Dict]]) -> Optional[Dict[str, torc
     batch = sorted(batch, key=lambda x: x['length'], reverse=True)
 
     max_len = batch[0]['length']
+
+    # 序列长度分桶 (关键优化！)
+    # 将 max_len 向上取整到最近的桶边界
+    # 桶大小: 512 tokens
+    # 这样 FlexAttention 只需要编译 16 个 kernel (8192/512=16)
+    BUCKET_SIZE = 512
+    max_len = ((max_len + BUCKET_SIZE - 1) // BUCKET_SIZE) * BUCKET_SIZE
+    max_len = min(max_len, 8192)  # 不超过 max_seq_len
     batch_size = len(batch)
 
     # 预分配张量
