@@ -180,6 +180,7 @@ class FlexSummaryAttentionMask:
         seq_len: int,
         token_type_ids: Optional[torch.Tensor] = None,
         note_ids: Optional[torch.Tensor] = None,
+        doc_ids: Optional[torch.Tensor] = None,  # 新增: 文档 ID (用于序列打包)
     ) -> Callable:
         """
         创建 Updating 阶段的 mask_mod (RS + RR)
@@ -218,6 +219,13 @@ class FlexSummaryAttentionMask:
         # RR mask 参数
         cross_inst_full_range = self.rr_mask_generator.cross_inst_full_range
         cross_inst_far_offsets = self.rr_mask_generator.cross_inst_far_offsets
+
+        # 序列打包: doc_id 约束 (不同文档间不能互相注意)
+        use_doc_mask = doc_ids is not None
+        doc_ids_len = 0
+        if use_doc_mask:
+            doc_ids = doc_ids.contiguous()
+            doc_ids_len = doc_ids.size(0)
 
         def mask_mod(b, h, q_idx, kv_idx):
             # 安全处理越界索引 - 使用实际 tensor 长度来 clamp
@@ -294,6 +302,13 @@ class FlexSummaryAttentionMask:
             else:
                 rr_mask = is_kv_regular & rr_causal & bar_mask
 
+            # 序列打包: 不同文档间不能互相注意
+            if use_doc_mask:
+                q_doc = doc_ids[q_idx_safe.clamp(0, doc_ids_len - 1)]
+                k_doc = doc_ids[reg_kv_idx.clamp(0, doc_ids_len - 1)]
+                same_doc = (q_doc == k_doc)
+                rr_mask = rr_mask & same_doc
+
             return rs_mask | rr_mask
 
         return mask_mod
@@ -309,9 +324,13 @@ class FlexSummaryAttentionMask:
         device: torch.device,
         token_type_ids: Optional[torch.Tensor] = None,
         note_ids: Optional[torch.Tensor] = None,
+        doc_ids: Optional[torch.Tensor] = None,  # 新增: 文档 ID (用于序列打包)
     ) -> Tuple:
         """
         创建 Summarize 和 Updating 两个阶段的 BlockMask
+
+        Args:
+            doc_ids: 文档 ID tensor，用于序列打包时隔离不同文档的注意力
 
         Returns:
             (summarize_block_mask, updating_block_mask)
@@ -357,6 +376,17 @@ class FlexSummaryAttentionMask:
                 pad_len = seq_len - note_ids_flat.size(0)
                 note_ids_flat = F.pad(note_ids_flat, (0, pad_len), value=-1)
 
+        # 文档 ID (序列打包)
+        doc_ids_flat = None
+        if doc_ids is not None:
+            doc_ids_flat = doc_ids[0] if doc_ids.dim() == 2 else doc_ids
+            doc_ids_flat = doc_ids_flat.to(device)
+            if doc_ids_flat.size(0) < seq_len:
+                pad_len = seq_len - doc_ids_flat.size(0)
+                # 用最后一个文档 ID 填充 (padding 区域属于最后一个文档)
+                doc_ids_flat = F.pad(doc_ids_flat, (0, pad_len),
+                                     value=doc_ids_flat[-1].item() if doc_ids_flat.numel() > 0 else 0)
+
         # Summarize 阶段: Q=Summary, KV=[Summary; Regular]
         summarize_mask_mod = self.create_summarize_mask_mod(
             bar_ids_flat, num_bars, seq_len
@@ -377,6 +407,7 @@ class FlexSummaryAttentionMask:
             num_bars, seq_len,
             token_type_ids=token_type_ids_flat,
             note_ids=note_ids_flat,
+            doc_ids=doc_ids_flat,  # 序列打包支持
         )
         updating_block_mask = create_block_mask(
             updating_mask_mod,

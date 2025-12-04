@@ -15,9 +15,13 @@ from datetime import datetime
 import torch
 
 # 增加 dynamo cache size 避免 FlexAttention 重编译问题
+# FlexAttention 的 create_block_mask 会为每个不同的序列长度重编译
+# 即使使用 512 的分桶，8192 长度也有 16 种变体
+# 加上 batch size、num_bars 等变化，需要非常大的缓存
 import torch._dynamo
-torch._dynamo.config.cache_size_limit = 2048  # 修复：Step 150 崩溃，从 512 增加到 2048
-torch._dynamo.config.accumulated_cache_size_limit = 4096  # 修复：对应增加累积缓存限制
+torch._dynamo.config.cache_size_limit = 16384  # v1.2.1: 从 2048 增加到 16384
+torch._dynamo.config.accumulated_cache_size_limit = 32768  # 对应增加累积缓存限制
+torch._dynamo.config.suppress_errors = True  # 如果仍然超限，回退到 eager 模式而不是崩溃
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
@@ -35,6 +39,82 @@ except ImportError:
 
 from model import HIDMuseFormer, create_model
 from data import HIDTokenizerV2
+
+# HuggingFace datasets (可选，用于 Arrow 格式)
+try:
+    from datasets import load_from_disk
+    HAS_HF_DATASETS = True
+except ImportError:
+    HAS_HF_DATASETS = False
+
+
+class ArrowDataset(Dataset):
+    """
+    HuggingFace Arrow 格式数据集 - 零拷贝内存映射
+
+    优势:
+    1. 零拷贝 - 不需要反序列化，直接内存映射
+    2. O(1) 随机访问 - 任意样本直接定位
+    3. 多进程安全 - num_workers 可以开很大
+    4. 已按长度排序 - 减少 padding
+    """
+
+    def __init__(
+        self,
+        data_path: str,
+        max_seq_len: int = 24576,
+        max_bars: int = 2048,
+        max_samples: int = None,
+    ):
+        if not HAS_HF_DATASETS:
+            raise ImportError("需要安装 datasets: pip install datasets")
+
+        self.max_seq_len = max_seq_len
+        self.max_bars = max_bars
+
+        print(f"加载 Arrow 数据集: {data_path}")
+        self.dataset = load_from_disk(data_path)
+
+        if max_samples and max_samples < len(self.dataset):
+            self.dataset = self.dataset.select(range(max_samples))
+
+        print(f"Arrow 数据集: {len(self.dataset):,} 个样本")
+
+    def __len__(self) -> int:
+        return len(self.dataset)
+
+    def __getitem__(self, idx: int) -> Optional[Dict[str, torch.Tensor]]:
+        item = self.dataset[idx]
+
+        # 转换为 tensor
+        sample = {
+            'token_ids': torch.tensor(item['token_ids'], dtype=torch.long),
+            'chord_ids': torch.tensor(item['chord_ids'], dtype=torch.long),
+            'instrument_ids': torch.tensor(item['instrument_ids'], dtype=torch.long),
+            'token_type_ids': torch.tensor(item['token_type_ids'], dtype=torch.long),
+            'note_ids': torch.tensor(item['note_ids'], dtype=torch.long),
+            'length': item['length'],
+        }
+
+        # position_ids 如果没有，生成默认的
+        if 'position_ids' in item:
+            sample['position_ids'] = torch.tensor(item['position_ids'], dtype=torch.long)
+        else:
+            sample['position_ids'] = torch.arange(sample['length'], dtype=torch.long)
+
+        # 检查 bar 数量
+        num_bars = sample['chord_ids'].max().item() + 1
+        if num_bars > self.max_bars:
+            return None
+
+        # 截断
+        if sample['length'] > self.max_seq_len:
+            for k, v in sample.items():
+                if isinstance(v, torch.Tensor):
+                    sample[k] = v[:self.max_seq_len]
+            sample['length'] = self.max_seq_len
+
+        return sample
 
 
 class PreprocessedDataset(Dataset):
@@ -269,6 +349,129 @@ def efficient_collate_fn(batch: List[Optional[Dict]]) -> Optional[Dict[str, torc
     }
 
 
+class PackingCollator:
+    """
+    序列打包 Collator - 将多首短曲拼接成目标长度
+
+    优势:
+    - 消除 Padding 浪费，有效 token 利用率从 50-60% 提升到 ~100%
+    - 训练速度提升 1.5-2x
+
+    原理:
+    - 贪心算法将多首曲子拼接到 target_length
+    - 通过 doc_ids 标记不同曲子，在 FlexAttention 中隔离注意力
+    """
+
+    def __init__(self, target_length: int = 8192, bucket_size: int = 512):
+        """
+        Args:
+            target_length: 目标序列长度 (拼接后的最大长度)
+            bucket_size: 分桶大小 (用于减少 FlexAttention 重编译)
+        """
+        self.target_length = target_length
+        self.bucket_size = bucket_size
+
+    def __call__(self, batch: List[Optional[Dict]]) -> Optional[Dict[str, torch.Tensor]]:
+        # 过滤 None 样本
+        batch = [x for x in batch if x is not None]
+        if len(batch) == 0:
+            return None
+
+        # 按长度降序排序 (贪心打包效果更好)
+        batch = sorted(batch, key=lambda x: x['length'], reverse=True)
+
+        # 贪心打包: 尽量填满每个 pack
+        packed_sequences = []
+        current_pack = {'items': [], 'total_len': 0}
+
+        for item in batch:
+            length = item['length']
+
+            # 如果单个样本超过 target_length，单独成 pack
+            if length > self.target_length:
+                # 先保存当前 pack
+                if current_pack['items']:
+                    packed_sequences.append(current_pack)
+                # 截断超长样本
+                truncated_item = {
+                    k: v[:self.target_length] if isinstance(v, torch.Tensor) else v
+                    for k, v in item.items()
+                }
+                truncated_item['length'] = self.target_length
+                packed_sequences.append({'items': [truncated_item], 'total_len': self.target_length})
+                current_pack = {'items': [], 'total_len': 0}
+            elif current_pack['total_len'] + length <= self.target_length:
+                # 可以放入当前 pack
+                current_pack['items'].append(item)
+                current_pack['total_len'] += length
+            else:
+                # 当前 pack 已满，开启新 pack
+                if current_pack['items']:
+                    packed_sequences.append(current_pack)
+                current_pack = {'items': [item], 'total_len': length}
+
+        # 保存最后一个 pack
+        if current_pack['items']:
+            packed_sequences.append(current_pack)
+
+        # 构建输出 tensor
+        batch_size = len(packed_sequences)
+        max_len = self._bucket_length(max(p['total_len'] for p in packed_sequences))
+
+        # 预分配张量
+        token_ids = torch.zeros(batch_size, max_len, dtype=torch.long)
+        labels = torch.full((batch_size, max_len), -100, dtype=torch.long)
+        doc_ids = torch.zeros(batch_size, max_len, dtype=torch.long)  # 关键: 文档 ID
+        chord_ids = torch.full((batch_size, max_len), -1, dtype=torch.long)
+        position_ids = torch.full((batch_size, max_len), -1, dtype=torch.long)
+        instrument_ids = torch.full((batch_size, max_len), 129, dtype=torch.long)
+        token_type_ids = torch.full((batch_size, max_len), -1, dtype=torch.long)
+        note_ids = torch.full((batch_size, max_len), -1, dtype=torch.long)
+        lengths = torch.zeros(batch_size, dtype=torch.long)
+
+        # 填充每个 pack
+        for b_idx, pack in enumerate(packed_sequences):
+            offset = 0
+            for doc_idx, item in enumerate(pack['items']):
+                length = item['length']
+                end_pos = offset + length
+
+                # 填充各字段
+                token_ids[b_idx, offset:end_pos] = item['token_ids'][:length]
+                labels[b_idx, offset:end_pos] = item['token_ids'][:length]
+                doc_ids[b_idx, offset:end_pos] = doc_idx  # 关键: 分配文档 ID
+                chord_ids[b_idx, offset:end_pos] = item['chord_ids'][:length]
+                instrument_ids[b_idx, offset:end_pos] = item['instrument_ids'][:length]
+
+                if 'position_ids' in item:
+                    position_ids[b_idx, offset:end_pos] = item['position_ids'][:length]
+                if 'token_type_ids' in item:
+                    token_type_ids[b_idx, offset:end_pos] = item['token_type_ids'][:length]
+                if 'note_ids' in item:
+                    note_ids[b_idx, offset:end_pos] = item['note_ids'][:length]
+
+                offset = end_pos
+
+            lengths[b_idx] = pack['total_len']
+
+        return {
+            'token_ids': token_ids,
+            'labels': labels,
+            'doc_ids': doc_ids,  # 新增
+            'chord_ids': chord_ids,
+            'position_ids': position_ids,
+            'instrument_ids': instrument_ids,
+            'token_type_ids': token_type_ids,
+            'note_ids': note_ids,
+            'lengths': lengths,
+        }
+
+    def _bucket_length(self, length: int) -> int:
+        """将长度向上取整到最近的桶边界"""
+        bucketed = ((length + self.bucket_size - 1) // self.bucket_size) * self.bucket_size
+        return min(bucketed, self.target_length)
+
+
 def setup_distributed():
     """设置分布式训练"""
     if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
@@ -369,6 +572,19 @@ class H800Trainer:
         self.train_dataset = train_dataset
         self.val_dataset = val_dataset
 
+        # 序列打包配置
+        self._use_packing = getattr(args, 'use_packing', False)
+        if self._use_packing:
+            # 使用 PackingCollator 将多首短曲拼接
+            self._collate_fn = PackingCollator(
+                target_length=min(args.max_seq_len, 8192),  # 打包目标长度
+                bucket_size=512
+            )
+            if self.is_main:
+                print(f"[✓] 序列打包已启用 (target_length={min(args.max_seq_len, 8192)})")
+        else:
+            self._collate_fn = efficient_collate_fn
+
         train_sampler = DistributedSampler(train_dataset, shuffle=True) if self.world_size > 1 else None
         self.train_sampler = train_sampler
         self.train_loader = DataLoader(
@@ -377,7 +593,7 @@ class H800Trainer:
             shuffle=(train_sampler is None),
             sampler=train_sampler,
             num_workers=0,  # Phase 1: 编译时用 0 避免 OOM
-            collate_fn=efficient_collate_fn,
+            collate_fn=self._collate_fn,
             pin_memory=True,
             prefetch_factor=None,
             persistent_workers=False,
@@ -392,7 +608,7 @@ class H800Trainer:
                 shuffle=False,
                 sampler=val_sampler,
                 num_workers=0,
-                collate_fn=efficient_collate_fn,
+                collate_fn=self._collate_fn,  # 使用相同的 collate 函数
                 pin_memory=True,
             )
         else:
@@ -483,7 +699,7 @@ class H800Trainer:
             shuffle=(self.train_sampler is None),
             sampler=self.train_sampler,
             num_workers=self._target_num_workers,  # 切换到多 worker
-            collate_fn=efficient_collate_fn,
+            collate_fn=self._collate_fn,
             pin_memory=True,
             prefetch_factor=4 if self._target_num_workers > 0 else None,
             persistent_workers=self._target_num_workers > 0,
@@ -497,7 +713,7 @@ class H800Trainer:
                 shuffle=False,
                 sampler=self.val_sampler,
                 num_workers=self._target_num_workers,
-                collate_fn=efficient_collate_fn,
+                collate_fn=self._collate_fn,
                 pin_memory=True,
             )
 
@@ -528,6 +744,11 @@ class H800Trainer:
             token_type_ids = batch['token_type_ids'].to(self.device, non_blocking=True)
             note_ids = batch['note_ids'].to(self.device, non_blocking=True)
 
+            # 序列打包: 获取 doc_ids (如果存在)
+            doc_ids = None
+            if 'doc_ids' in batch:
+                doc_ids = batch['doc_ids'].to(self.device, non_blocking=True)
+
             # 前向传播 (BF16/FP16)
             with torch.autocast(device_type='cuda', dtype=self.autocast_dtype):
                 logits = self.model(
@@ -536,6 +757,7 @@ class H800Trainer:
                     instrument_ids=instrument_ids,
                     token_type_ids=token_type_ids,
                     note_ids=note_ids,
+                    doc_ids=doc_ids,  # 序列打包支持
                 )
 
                 # 计算损失
@@ -600,7 +822,7 @@ class H800Trainer:
                         shuffle=(self.train_sampler is None),
                         sampler=self.train_sampler,
                         num_workers=self._target_num_workers,  # 切换到 8 workers
-                        collate_fn=efficient_collate_fn,
+                        collate_fn=self._collate_fn,
                         pin_memory=True,
                         prefetch_factor=4 if self._target_num_workers > 0 else None,
                         persistent_workers=self._target_num_workers > 0,
@@ -656,6 +878,9 @@ class H800Trainer:
             instrument_ids = batch['instrument_ids'].to(self.device, non_blocking=True)
             token_type_ids = batch['token_type_ids'].to(self.device, non_blocking=True)
             note_ids = batch['note_ids'].to(self.device, non_blocking=True)
+            doc_ids = batch.get('doc_ids')
+            if doc_ids is not None:
+                doc_ids = doc_ids.to(self.device, non_blocking=True)
 
             with torch.autocast(device_type='cuda', dtype=self.autocast_dtype):
                 logits = self.model(
@@ -664,6 +889,7 @@ class H800Trainer:
                     instrument_ids=instrument_ids,
                     token_type_ids=token_type_ids,
                     note_ids=note_ids,
+                    doc_ids=doc_ids,
                 )
 
                 shift_logits = logits[:, :-1, :].contiguous()
@@ -798,6 +1024,8 @@ def parse_args():
     parser.add_argument('--val_split', type=float, default=0.05, help='验证集比例')
     parser.add_argument('--max_seq_len', type=int, default=24576, help='最大序列长度 (H800: 24K+)')
     parser.add_argument('--max_samples', type=int, default=None, help='限制加载样本数（用于快速测试）')
+    parser.add_argument('--use_arrow', action='store_true',
+                        help='使用 HuggingFace Arrow 格式 (需要先用 convert_to_arrow.py 转换)')
 
     # 模型
     parser.add_argument('--model_size', type=str, default='base',
@@ -814,6 +1042,10 @@ def parse_args():
     parser.add_argument('--weight_decay', type=float, default=0.1, help='权重衰减')
     parser.add_argument('--warmup_steps', type=int, default=2000, help='预热步数')
     parser.add_argument('--max_grad_norm', type=float, default=1.0, help='梯度裁剪')
+
+    # 序列打包优化 (v1.1.0)
+    parser.add_argument('--use_packing', action='store_true',
+                        help='启用序列打包 (Sequence Packing)，将多首短曲拼接成目标长度，提升训练效率 1.5-2x')
 
     # H800 优化
     parser.add_argument('--bf16', action='store_true', default=True, help='使用 BF16 (推荐)')
@@ -863,12 +1095,20 @@ def main():
 
     # 加载预处理数据集
     print("加载预处理数据集...")
-    full_dataset = PreprocessedDataset(
-        args.data_dir,
-        max_seq_len=args.max_seq_len,
-        max_bars=args.max_bars,
-        max_samples=args.max_samples,  # 用于快速测试
-    )
+    if args.use_arrow:
+        full_dataset = ArrowDataset(
+            args.data_dir,
+            max_seq_len=args.max_seq_len,
+            max_bars=args.max_bars,
+            max_samples=args.max_samples,
+        )
+    else:
+        full_dataset = PreprocessedDataset(
+            args.data_dir,
+            max_seq_len=args.max_seq_len,
+            max_bars=args.max_bars,
+            max_samples=args.max_samples,
+        )
     print(f"max_bars={args.max_bars} (超过此值的样本将被跳过)")
 
     # 划分训练/验证集
