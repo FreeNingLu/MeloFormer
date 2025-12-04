@@ -35,51 +35,30 @@ env/
 
 # Jupyter
 .ipynb_checkpoints/
-*.ipynb
 
-# Data
-data/
-processed_data/
-processed_data*/
-*.mid
-*.midi
-*.npz
-*.pkl
-*.cache
-*.wav
-*.mp3
-
-# Checkpoints
-checkpoints/
-outputs/
+# Data files (too large for git)
 *.pt
 *.pth
+*.bin
+*.safetensors
 *.ckpt
+*.tar.gz
+*.zip
+midi_valid/
+processed_data/
+arrow_data/
+outputs*/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
 
 # Logs
 *.log
-logs/
-runs/
-wandb/
-
-# OS
-.DS_Store
-Thumbs.db
+nohup.out
 
 # Temporary files
 *.tmp
-tmp/
-
-# Compressed files
-*.tar.gz
-*.zip
-
-# Test outputs
-test_output/
-optimal_config.json
-
-# Archived code
-archived/
-
-# External models
-Qwen3-Embedding-0.6B/
+*.temp
+archived/others/muzic

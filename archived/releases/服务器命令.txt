@@ -1,0 +1,94 @@
+# ========================================
+# MeloFormer v0.9.0 服务器启动命令
+# 复制粘贴到服务器终端执行
+# ========================================
+
+# 步骤 1: 进入工作目录
+cd ~/autodl-tmp
+
+# 步骤 2: 解压代码
+tar -xzf MeloFormer_v0.9.0.tar.gz
+
+# 步骤 3: 进入代码目录
+cd hid_museformer_v0.9
+
+# 步骤 4: 启动训练（单卡）
+python train.py \
+    --model_size small \
+    --data_dir ~/autodl-tmp/processed_data \
+    --output_dir ~/autodl-tmp/checkpoints \
+    --max_seq_len 8192 \
+    --batch_size 4 \
+    --gradient_accumulation_steps 8 \
+    --learning_rate 3e-4 \
+    --epochs 100 \
+    --num_workers 8 \
+    --log_interval 10 \
+    --save_interval 5000
+
+
+# ========================================
+# 如果需要后台运行（推荐）
+# ========================================
+
+# 使用 nohup 后台运行
+nohup python train.py \
+    --model_size small \
+    --data_dir ~/autodl-tmp/processed_data \
+    --output_dir ~/autodl-tmp/checkpoints \
+    --max_seq_len 8192 \
+    --batch_size 4 \
+    --gradient_accumulation_steps 8 \
+    --learning_rate 3e-4 \
+    --epochs 100 \
+    --num_workers 8 \
+    --log_interval 10 \
+    --save_interval 5000 > train.log 2>&1 &
+
+# 查看日志
+tail -f train.log
+
+
+# ========================================
+# 如果需要多卡 DDP 训练（8 卡）
+# ========================================
+
+torchrun --nproc_per_node=8 train.py \
+    --model_size small \
+    --data_dir ~/autodl-tmp/processed_data \
+    --output_dir ~/autodl-tmp/checkpoints \
+    --max_seq_len 8192 \
+    --batch_size 4 \
+    --gradient_accumulation_steps 1 \
+    --learning_rate 3e-4 \
+    --epochs 100 \
+    --num_workers 8 \
+    --log_interval 10 \
+    --save_interval 5000
+
+
+# ========================================
+# 常用命令
+# ========================================
+
+# 查看 GPU 使用情况
+watch -n 1 nvidia-smi
+
+# 查看训练进度（如果用了 nohup）
+tail -f train.log
+
+# 杀掉训练进程
+pkill -f train.py
+
+# 从 checkpoint 继续训练
+python train.py \
+    --model_size small \
+    --data_dir ~/autodl-tmp/processed_data \
+    --output_dir ~/autodl-tmp/checkpoints \
+    --resume_from ~/autodl-tmp/checkpoints/checkpoint_latest.pt \
+    --max_seq_len 8192 \
+    --batch_size 4 \
+    --gradient_accumulation_steps 8 \
+    --learning_rate 3e-4 \
+    --epochs 100 \
+    --num_workers 8

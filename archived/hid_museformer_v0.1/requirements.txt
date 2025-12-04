@@ -1,0 +1,17 @@
+# HID-MuseFormer 依赖
+
+# 核心依赖
+torch>=2.0.0
+numpy>=1.21.0
+tqdm>=4.60.0
+
+# MIDI 处理
+mido>=1.2.10
+pretty_midi>=0.2.10
+
+# 训练监控 (可选)
+tensorboard>=2.10.0
+# wandb>=0.13.0  # 取消注释以启用 WandB
+
+# 其他
+pathlib2>=2.3.0

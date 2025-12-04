@@ -1,0 +1,73 @@
+# ========================================
+# MeloFormer v0.9.2 FIXED - 渐进式切换
+# 服务器启动命令
+# ========================================
+
+# 停止旧训练
+pkill -f train.py
+
+# 解压新版本
+cd ~/autodl-tmp
+tar -xzf MeloFormer_v0.9.2_FIXED.tar.gz
+cd hid_museformer_v0.9
+
+# 启动训练
+python train.py \
+    --model_size small \
+    --data_dir ~/autodl-tmp/processed_data \
+    --output_dir ~/autodl-tmp/checkpoints \
+    --max_seq_len 8192 \
+    --batch_size 4 \
+    --gradient_accumulation_steps 8 \
+    --learning_rate 3e-4 \
+    --epochs 100 \
+    --num_workers 8 \
+    --log_interval 10 \
+    --save_interval 5000
+
+
+# ========================================
+# 预期训练过程
+# ========================================
+
+# Step 1-50: num_workers=0
+# - 编译完成（Step 10）
+# - 继续用单进程加载（Step 11-49）
+# - 内存占用: ~50-60GB（安全）
+# - Tokens/s: ~700-1000（慢但安全）
+
+# Step 50: 切换！
+============================================================
+✅ FlexAttention 编译完成！
+🔄 切换 DataLoader: num_workers 0 → 8
+============================================================
+
+# Step 51+: num_workers=8
+# - 8 个 worker 并行加载
+# - 逐步填充 30 个分片缓存
+# - 内存占用: 60GB → 75GB（稳定）
+# - Tokens/s: 1000 → 6000-7000（快！）
+
+
+# ========================================
+# 后台运行
+# ========================================
+
+nohup python train.py \
+    --model_size small \
+    --data_dir ~/autodl-tmp/processed_data \
+    --output_dir ~/autodl-tmp/checkpoints \
+    --max_seq_len 8192 \
+    --batch_size 4 \
+    --gradient_accumulation_steps 8 \
+    --learning_rate 3e-4 \
+    --epochs 100 \
+    --num_workers 8 \
+    --log_interval 10 \
+    --save_interval 5000 > train.log 2>&1 &
+
+# 查看日志
+tail -f train.log
+
+# 监控内存
+watch -n 1 'free -h && echo "========" && nvidia-smi'

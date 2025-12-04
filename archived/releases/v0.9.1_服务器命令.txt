@@ -1,0 +1,112 @@
+# ========================================
+# MeloFormer v0.9.1 (120GB 内存优化版)
+# 服务器启动命令 - 复制粘贴执行
+# ========================================
+
+# 步骤 1: 停止当前训练（如果在运行）
+pkill -f train.py
+
+# 步骤 2: 进入工作目录
+cd ~/autodl-tmp
+
+# 步骤 3: 备份旧版本（可选）
+mv hid_museformer_v0.9 hid_museformer_v0.9_backup
+
+# 步骤 4: 解压新版本
+tar -xzf MeloFormer_v0.9.1_120GB.tar.gz
+
+# 步骤 5: 启动训练（单卡）
+cd hid_museformer_v0.9
+
+python train.py \
+    --model_size small \
+    --data_dir ~/autodl-tmp/processed_data \
+    --output_dir ~/autodl-tmp/checkpoints \
+    --max_seq_len 8192 \
+    --batch_size 4 \
+    --gradient_accumulation_steps 8 \
+    --learning_rate 3e-4 \
+    --epochs 100 \
+    --num_workers 8 \
+    --log_interval 10 \
+    --save_interval 5000
+
+
+# ========================================
+# 后台运行版本（推荐）
+# ========================================
+
+nohup python train.py \
+    --model_size small \
+    --data_dir ~/autodl-tmp/processed_data \
+    --output_dir ~/autodl-tmp/checkpoints \
+    --max_seq_len 8192 \
+    --batch_size 4 \
+    --gradient_accumulation_steps 8 \
+    --learning_rate 3e-4 \
+    --epochs 100 \
+    --num_workers 8 \
+    --log_interval 10 \
+    --save_interval 5000 > train.log 2>&1 &
+
+# 查看日志
+tail -f train.log
+
+# 监控 GPU 和内存
+watch -n 1 'nvidia-smi && echo "========" && free -h'
+
+
+# ========================================
+# 预期效果
+# ========================================
+
+# 首次运行:
+# - Step 1-10: 编译阶段，GPU ~60%（正常）
+# - Step 10: 切换 DataLoader，开始加载所有 53 个分片到内存
+# - Step 10-50: 逐步加载分片，内存占用逐渐上升到 ~100GB
+# - Step 50+: 所有分片已加载，速度稳定在 7000-8000 tokens/s
+
+# 内存占用:
+# - 数据缓存: ~60GB (53 个分片)
+# - 训练进程: ~40GB (模型+优化器+激活值)
+# - 总计: ~100GB / 120GB
+
+# GPU 利用率:
+# - 稳定在 95-100%
+
+# Tokens/s:
+# - Step 10: ~700 (刚切换)
+# - Step 50: ~7500 (分片加载完成)
+# - Step 100+: ~7500-8000 (稳定)
+
+
+# ========================================
+# 如果内存不够（极少数情况）
+# ========================================
+
+# 方案 1: 减少分片缓存
+# 编辑 train.py 第 100 行
+# self._max_cache_size = 53  →  self._max_cache_size = 30
+
+# 方案 2: 减少 num_workers
+# --num_workers 8  →  --num_workers 4
+
+
+# ========================================
+# 故障排查
+# ========================================
+
+# 检查内存使用
+free -h
+
+# 检查数据加载速度
+# 观察日志中的 Tokens/s 是否在 Step 50 后达到 7000+
+
+# 检查分片是否全部加载
+# 在训练日志中看到 "懒加载模式: 529,036 个样本 (缓存 53 个分片)"
+# 这表示会尝试缓存所有 53 个分片
+
+# 如果速度还是慢
+# 1. 检查是否有其他进程占用内存
+# 2. 检查磁盘 I/O: iostat -x
+# 3. 联系我进一步诊断
