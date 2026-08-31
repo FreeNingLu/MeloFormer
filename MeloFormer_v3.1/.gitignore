@@ -1,0 +1,5 @@
+runs/
+docs/
+.cache/
+__pycache__
+.venv
